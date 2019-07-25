@@ -1,14 +1,8 @@
-use std::env;
-use std::error::Error;
-use std::fmt;
-use std::io;
-
 extern crate clap;
 extern crate json;
 mod trace;
-use trace::google_trace;
 
-use clap::{App, Arg, SubCommand};
+use clap::{App, Arg};
 
 fn main() {
     let matches = App::new("Tracer")
@@ -20,12 +14,15 @@ fn main() {
         )
         .get_matches();
 
-    let file = google_trace::load_file(
+    let file = trace::google_trace::load_file(
         matches
             .value_of("chrome_trace")
             .expect("Must specify chrome_trace"),
     )
     .unwrap();
 
-    println!("Hello, world! {}", file.threads[0].events.len());
+    println!(
+        "Hello, world! {:?}",
+        (file.threads.len(), file.async_events.len())
+    );
 }
