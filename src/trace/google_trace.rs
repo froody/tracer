@@ -1,19 +1,13 @@
 use super::trace_types::*;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
-static MISSING_TS: &str = "Missing 'ts' field";
-static MISSING_PH: &str = "Missing 'ph' field";
-static MISSING_ID: &str = "Missing 'id' field";
-static MISSING_TID: &str = "Missing 'tid' field";
 static NOT_ARRAY: &str = "Value isn't 'array'";
 
-macro_rules! to_some {
-    ($x:expr) => {
-        $x.ok_or_else(|| format!("expected Some, got None on {}", line!()))?
-    };
-}
+type EventMap<'a> = HashMap<&'a str, &'a json::JsonValue>;
 
-fn make_hash_map(object: &json::JsonValue) -> HashMap<&str, &json::JsonValue> {
+fn make_hash_map(object: &json::JsonValue) -> EventMap {
     let mut ret = HashMap::new();
     for (key, value) in object.entries() {
         ret.insert(key, value);
@@ -22,16 +16,31 @@ fn make_hash_map(object: &json::JsonValue) -> HashMap<&str, &json::JsonValue> {
     ret
 }
 
+pub fn get_str<'a>(event_map: &'a EventMap, name: &str) -> Result<&'a str, TraceError> {
+    let result = event_map
+        .get(name)
+        .ok_or_else(|| format!("Missing '{}' field", name))?
+        .as_str()
+        .ok_or("Expected Some, got None")?;
+    Ok(result)
+}
+
+pub fn get_u64<'a>(event_map: &'a EventMap, name: &str) -> Result<u64, TraceError> {
+    let result = event_map
+        .get(name)
+        .ok_or_else(|| format!("Missing '{}' field", name))?
+        .as_u64()
+        .ok_or("Expected Some, got None")?;
+    Ok(result)
+}
+
 fn make_trace_event(
-    dict: &HashMap<&str, &json::JsonValue>,
+    dict: &EventMap,
+    event_type: Rc<TraceEventType>,
     finished: bool,
 ) -> Result<TraceEvent, TraceError> {
     Ok(TraceEvent {
-        ts: dict
-            .get("ts")
-            .ok_or(MISSING_TS)?
-            .as_u64()
-            .ok_or("couldn't decode u64")?,
+        ts: get_u64(dict, "ts")?,
         dur: match dict.get("dur") {
             None => 0,
             Some(json) => json.as_u64().ok_or("couldn't decode u64")?,
@@ -41,6 +50,8 @@ fn make_trace_event(
             Some(json) => json.as_u64().ok_or("couldn't decode u64")?,
         },
         finished: finished,
+        depth: 0,
+        event_type: event_type,
     })
 }
 
@@ -55,11 +66,9 @@ pub fn load_json(json_str: &str) -> Result<TraceFile, TraceError> {
     if !loaded.is_array() {
         return Err(TraceError::new(NOT_ARRAY));
     }
-    let mut threads: HashMap<u64, ThreadLoader> = HashMap::new();
-    let mut async_events: Vec<TraceEvent> = Vec::new();
-    let mut open_async_events: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut async_counter: usize = 0;
     let finished = false;
+    let mut loader = TraceLoader::new();
+
     let result: Result<Vec<()>, TraceError> = loaded
         .members()
         .map(|event| -> Result<(), TraceError> {
@@ -67,55 +76,45 @@ pub fn load_json(json_str: &str) -> Result<TraceFile, TraceError> {
                 return Err(TraceError::new("non-object event"));
             }
             let event_map = make_hash_map(&event);
-            let tid = event_map
-                .get("tid")
-                .ok_or(MISSING_TID)?
-                .as_u64()
-                .ok_or("tid not u64")?;
-            let thread_loader: &mut ThreadLoader = threads
-                .entry(tid)
-                .or_insert_with(|| ThreadLoader::new(format!("{}", tid)));
-            let value = event_map.get("ph").ok_or(MISSING_PH)?;
-            let thing: &str = to_some!((*value).as_str());
-            match thing {
+            let tid = get_u64(&event_map, "tid")?;
+            let phase = get_str(&event_map, "ph")?;
+            let name: &str = get_str(&event_map, "name")?;
+
+            match phase {
                 "B" => {
-                    thread_loader.open_events.push(thread_loader.events.len());
-                    thread_loader
-                        .events
-                        .push(make_trace_event(&event_map, finished)?);
+                    let event_type = loader.get_event_type(name, TraceEventClass::BeginEnd)?;
+                    loader.add_event(tid, make_trace_event(&event_map, event_type, false)?)?;
                 }
                 "E" => {
-                    let previous = thread_loader
-                        .open_events
-                        .pop()
-                        .ok_or("no matching open event")?;
-                    let previous = &mut thread_loader.events[previous];
-                    let current = make_trace_event(&event_map, finished)?;
-                    previous.finished = true;
-                    previous.dur = current.ts - previous.ts;
+                    let event_type = loader.get_event_type(name, TraceEventClass::BeginEnd)?;
+                    loader.add_event(tid, make_trace_event(&event_map, event_type, true)?)?;
                 }
                 "S" => {
-                    let id: String = event_map["id"].as_str().ok_or(MISSING_ID)?.into();
-                    open_async_events
-                        .entry(id)
-                        .or_insert_with(|| Vec::new())
-                        .push(async_counter);
-                    async_counter += 1;
-                    async_events.push(make_trace_event(&event_map, finished)?);
+                    let id: &str = get_str(&event_map, "id")?;
+                    let event_type = loader.get_event_type(name, TraceEventClass::Async)?;
+                    loader.add_async_event(
+                        tid,
+                        TraceEventClass::Async,
+                        name,
+                        id,
+                        make_trace_event(&event_map, event_type, false)?,
+                    )?;
                 }
                 "F" => {
-                    let id: String = event_map["id"].as_str().ok_or(MISSING_ID)?.into();
-                    match open_async_events.get_mut(&id) {
-                        Some(entry) => {
-                            let previous = entry.pop().ok_or("no matching open async event")?;
-                            async_events[previous].finished = true;
-                        }
-                        None => println!("unpaired async event {} @ {}", id, event_map["ts"]),
-                    }
+                    let id: &str = get_str(&event_map, "id")?;
+                    let event_type = loader.get_event_type(name, TraceEventClass::Async)?;
+                    loader.add_async_event(
+                        tid,
+                        TraceEventClass::Async,
+                        name,
+                        id,
+                        make_trace_event(&event_map, event_type, true)?,
+                    )?;
                 }
-                "X" => thread_loader
-                    .events
-                    .push(make_trace_event(&event_map, finished)?),
+                "X" => {
+                    let event_type = loader.get_event_type(name, TraceEventClass::Standalone)?;
+                    loader.add_event(tid, make_trace_event(&event_map, event_type, true)?)?;
+                }
                 _ => (),
             }
             return Ok(());
@@ -124,13 +123,7 @@ pub fn load_json(json_str: &str) -> Result<TraceFile, TraceError> {
 
     result?;
 
-    Ok(TraceFile {
-        threads: threads
-            .into_iter()
-            .map(|(_, value)| value.get_thread())
-            .collect(),
-        async_events: async_events,
-    })
+    loader.trace_file()
 }
 
 #[test]
@@ -138,7 +131,10 @@ fn test_malformed() {
     let json = "{}";
     assert_eq!(load_json(json).err().unwrap(), TraceError::new(NOT_ARRAY));
     let json = "[{}]";
-    assert_eq!(load_json(json).err().unwrap(), TraceError::new(MISSING_TID));
+    assert_eq!(
+        load_json(json).err().unwrap(),
+        TraceError::new("Missing 'tid' field")
+    );
 }
 
 #[test]
@@ -153,12 +149,16 @@ fn test_empty() {
 
 #[test]
 fn test_single_event() {
-    let json = "[{\"tid\": 123, \"ph\": \"X\", \"ts\":456}]";
+    let json = "[{\"tid\": 123, \"ph\": \"X\", \"ts\":456, \"name\": \"eventA\"}]";
     let result = load_json(json);
+    if result.is_err() {
+        println!("result {:?}", result);
+    }
     assert!(result.is_ok());
     let trace_file = result.ok().unwrap();
     assert_eq!(trace_file.async_events.len(), 0);
     assert_eq!(trace_file.threads.len(), 1);
+    assert_eq!(trace_file.event_types.len(), 1);
     let thread = &trace_file.threads[0];
     assert_eq!(thread.name, "123");
     assert_eq!(thread.events.len(), 1);
@@ -166,13 +166,20 @@ fn test_single_event() {
     assert_eq!(event.ts, 456);
     assert_eq!(event.dur, 0);
     assert_eq!(event.tdur, 0);
+    assert_eq!(event.depth, 0);
+    let event_type = &trace_file.event_types[0];
+    assert_eq!(event_type.name, "eventA");
+    assert_eq!(event_type.count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn test_event_pair() {
     let json =
-        "[{\"tid\": 123, \"ph\": \"B\", \"ts\":456}, {\"tid\": 123, \"ph\": \"E\", \"ts\":656}]";
+        "[{\"tid\": 123, \"ph\": \"B\", \"ts\":456, \"name\": \"eventA\"}, {\"tid\": 123, \"ph\": \"E\", \"ts\":656, \"name\": \"eventA\"}]";
     let result = load_json(json);
+    if result.is_err() {
+        println!("result {:?}", result);
+    }
     assert!(result.is_ok());
     let trace_file = result.ok().unwrap();
     assert_eq!(trace_file.async_events.len(), 0);
@@ -184,4 +191,68 @@ fn test_event_pair() {
     assert_eq!(event.ts, 456);
     assert_eq!(event.dur, 200);
     assert_eq!(event.tdur, 0);
+    assert_eq!(event.depth, 0);
+    assert_eq!(trace_file.event_types.len(), 1);
+    let event_type = &trace_file.event_types[0];
+    assert_eq!(event_type.name, "eventA");
+    assert_eq!(event_type.count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_nested_event_pair() {
+    let json = "[\
+                {\"tid\": 123, \"ph\": \"B\", \"ts\":456, \"name\": \"eventA\"}, \
+                {\"tid\": 123, \"ph\": \"B\", \"ts\":556, \"name\": \"eventB\"}, \
+                {\"tid\": 123, \"ph\": \"E\", \"ts\":600, \"name\": \"eventB\"}, \
+                {\"tid\": 123, \"ph\": \"E\", \"ts\":656, \"name\": \"eventA\"}, \
+                {\"tid\": 123, \"ph\": \"X\", \"ts\":580, \"name\": \"eventC\", \"dur\": 10} \
+                ]";
+    let result = load_json(json);
+    if result.is_err() {
+        println!("result {:?}", result);
+    }
+    assert!(result.is_ok());
+    let trace_file = result.ok().unwrap();
+    assert_eq!(trace_file.async_events.len(), 0);
+    assert_eq!(trace_file.threads.len(), 1);
+    let thread = &trace_file.threads[0];
+    assert_eq!(thread.name, "123");
+    assert_eq!(thread.events.len(), 3);
+    let event_a = &thread.events[0];
+    assert_eq!(event_a.ts, 456);
+    assert_eq!(event_a.dur, 200);
+    assert_eq!(event_a.tdur, 0);
+    assert_eq!(event_a.depth, 0);
+    let event_b = &thread.events[1];
+    assert_eq!(event_b.ts, 556);
+    assert_eq!(event_b.dur, 44);
+    assert_eq!(event_b.tdur, 0);
+    assert_eq!(event_b.depth, 1);
+    let event_c = &thread.events[2];
+    assert_eq!(event_c.ts, 580);
+    assert_eq!(event_c.dur, 10);
+    assert_eq!(event_c.tdur, 0);
+    assert_eq!(event_c.depth, 2);
+    assert_eq!(trace_file.event_types.len(), 3);
+    let event_type_a = trace_file
+        .event_types
+        .iter()
+        .find(|&x| x.name == "eventA")
+        .unwrap();
+    assert_eq!(event_type_a.name, "eventA");
+    assert_eq!(event_type_a.count.load(Ordering::SeqCst), 1);
+    let event_type_b = trace_file
+        .event_types
+        .iter()
+        .find(|&x| x.name == "eventB")
+        .unwrap();
+    assert_eq!(event_type_b.name, "eventB");
+    assert_eq!(event_type_b.count.load(Ordering::SeqCst), 1);
+    let event_type_c = trace_file
+        .event_types
+        .iter()
+        .find(|&x| x.name == "eventC")
+        .unwrap();
+    assert_eq!(event_type_c.name, "eventC");
+    assert_eq!(event_type_c.count.load(Ordering::SeqCst), 1);
 }

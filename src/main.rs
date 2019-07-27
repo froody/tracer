@@ -1,6 +1,8 @@
 extern crate clap;
 extern crate json;
 mod trace;
+use std::sync::atomic::Ordering;
+use trace::trace_types::TraceEventType;
 
 use clap::{App, Arg};
 
@@ -23,6 +25,18 @@ fn main() {
 
     println!(
         "Hello, world! {:?}",
-        (file.threads.len(), file.async_events.len())
+        (
+            file.threads.len(),
+            file.async_events.len(),
+            file.event_types.len()
+        )
     );
+    for event_type in file.event_types {
+        let event_type: &TraceEventType = &event_type;
+        println!(
+            "event {}: {}",
+            event_type.name,
+            event_type.count.load(Ordering::SeqCst)
+        );
+    }
 }
