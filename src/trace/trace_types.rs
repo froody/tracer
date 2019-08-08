@@ -185,7 +185,6 @@ impl TraceLoader {
             .entry(tid)
             .or_insert_with(|| ThreadLoader::new(format!("{}", tid)));
 
-        let mut event = event;
         if (*event.event_type).class != TraceEventClass::BeginEnd || !event.finished {
             (*event.event_type).count.fetch_add(1, Ordering::SeqCst);
         }
