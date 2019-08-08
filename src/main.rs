@@ -20,25 +20,25 @@ use winit::{
 };
 
 static VS_SRC: &'static str = "
-#version 150
+#version 450 core
 in vec2 position;
 void main() {
     gl_Position = vec4(position, 0.0, 1.0);
 }";
 
 static FS_SRC: &'static str = "
-#version 150
+#version 450 core
 out vec4 out_color;
 void main() {
     out_color = vec4(1.0, 1.0, 1.0, 1.0);
 }";
 
 static GS_SRC: &'static str = "
-#version 150
-layout (triangles) in;
-layout (triangle_strip, max_vertices = 3) out;
+#version 450 core
+layout (points) in;
+layout (triangle_strip, max_vertices = 256) out;
 void main() {
-    for (int i = 0; i < 3; i++) 
+    for (int i = 0; i < 1; i++) 
     {
             //gl_Position = gl_in[i].gl_Position;
             //EmitVertex();
@@ -48,12 +48,14 @@ void main() {
         vec4 position = gl_in[i].gl_Position;
         gl_Position = vec4(position.x - 0.05, position.y - 0.1, position.z, position.w);
         EmitVertex();
+        gl_Position = vec4(position.x - 0.05, position.y + 0.1, position.z, position.w);
+        EmitVertex();
         gl_Position = vec4(position.x + 0.05, position.y - 0.1, position.z, position.w);
         EmitVertex();
-        gl_Position = vec4(position.x, position.y + 0.1, position.z, position.w);
+        gl_Position = vec4(position.x + 0.05, position.y + 0.1, position.z, position.w);
         EmitVertex();
+        EndPrimitive();
     }
-    EndPrimitive();
 }";
 
 fn compile_shader(src: &str, ty: GLenum) -> GLuint {
@@ -158,6 +160,9 @@ fn do_loop() {
         );
         gl::UseProgram(program);
         gl::BindFragDataLocation(program, 0, CString::new("out_color").unwrap().as_ptr());
+        let mut max_vertices = 0;
+        gl::GetIntegerv(gl::MAX_GEOMETRY_OUTPUT_VERTICES, &mut max_vertices);
+        println!("max vertices: {}", max_vertices);
 
         // Specify the layout of the vertex data
         let pos_attr = gl::GetAttribLocation(program, CString::new("position").unwrap().as_ptr());
@@ -185,7 +190,7 @@ fn do_loop() {
                 let version = gl::GetString(gl::VERSION);
                 println!("redraw yo! {:?}", CStr::from_ptr(version as *const i8));
                 // Use shader program
-                gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 3);
+                gl::DrawArrays(gl::POINTS, 0, 3);
 
                 windowed_context.swap_buffers().unwrap();
             },
