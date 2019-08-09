@@ -60,7 +60,7 @@ impl From<&str> for TraceError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceThread {
     pub name: String,
     pub events: Vec<TraceEvent>,
@@ -221,7 +221,7 @@ impl TraceLoader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceEvent {
     pub ts: u64,
     pub dur: u64,
